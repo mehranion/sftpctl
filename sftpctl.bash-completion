@@ -1,0 +1,102 @@
+# bash completion for sftpctl
+# install to /etc/bash_completion.d/sftpctl (or /usr/share/bash-completion/completions/sftpctl)
+
+_sftpctl_group() {
+  # honour a configured SFTP_GROUP so completion matches the running setup
+  local g=sftpusers
+  [[ -r /etc/sftpctl.conf ]] && g=$(
+    awk -F= '/^[[:space:]]*SFTP_GROUP=/ {gsub(/["\x27[:space:]]/,"",$2); print $2}' \
+      /etc/sftpctl.conf | tail -1
+  )
+  echo "${g:-sftpusers}"
+}
+
+_sftpctl_users() {
+  getent group "$(_sftpctl_group)" 2>/dev/null | cut -d: -f4 | tr ',' ' '
+}
+
+_sftpctl_vgs() {
+  vgs --noheadings -o vg_name 2>/dev/null | tr -d ' '
+}
+
+_sftpctl() {
+  local cur prev cmd
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  cmd="${COMP_WORDS[1]:-}"
+
+  local commands="volumes config provision setup add quota passwd addkey delkey
+                  list show disable enable remove check help"
+
+  # completing the subcommand itself
+  if (( COMP_CWORD == 1 )); then
+    mapfile -t COMPREPLY < <(compgen -W "$commands" -- "$cur")
+    return
+  fi
+
+  # --vg= completes live volume group names
+  if [[ "$cur" == --vg=* ]]; then
+    mapfile -t COMPREPLY < <(compgen -W "$(_sftpctl_vgs)" -- "${cur#--vg=}")
+    COMPREPLY=("${COMPREPLY[@]/#/--vg=}")
+    return
+  fi
+
+  # --base= and --key= complete paths
+  if [[ "$cur" == --base=* ]]; then
+    mapfile -t COMPREPLY < <(compgen -d -- "${cur#--base=}")
+    COMPREPLY=("${COMPREPLY[@]/#/--base=}")
+    return
+  fi
+  if [[ "$cur" == --key=* ]]; then
+    mapfile -t COMPREPLY < <(compgen -f -- "${cur#--key=}")
+    COMPREPLY=("${COMPREPLY[@]/#/--key=}")
+    return
+  fi
+
+  case "$cmd" in
+    show|quota|passwd|addkey|delkey|disable|enable|remove)
+      # first argument after these is always a managed username
+      if (( COMP_CWORD == 2 )); then
+        mapfile -t COMPREPLY < <(compgen -W "$(_sftpctl_users)" -- "$cur")
+        return
+      fi
+      case "$cmd" in
+        passwd)  mapfile -t COMPREPLY < <(compgen -W "--ask --stdin --gen --lock --unlock" -- "$cur") ;;
+        remove)  mapfile -t COMPREPLY < <(compgen -W "--purge" -- "$cur") ;;
+        quota)   mapfile -t COMPREPLY < <(compgen -W "500M 1G 5G 10G 25G 50G 100G" -- "$cur") ;;
+        addkey)  mapfile -t COMPREPLY < <(compgen -f -- "$cur") ;;
+      esac
+      ;;
+    add)
+      if (( COMP_CWORD == 2 )); then
+        return   # a new username: nothing sensible to suggest
+      elif (( COMP_CWORD == 3 )) && [[ "$cur" != -* ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "500M 1G 5G 10G 25G 50G 100G" -- "$cur")
+      else
+        mapfile -t COMPREPLY < <(compgen -W "--pass --ask --key= --base= --expire=" -- "$cur")
+      fi
+      ;;
+    provision)
+      if (( COMP_CWORD == 2 )); then
+        mapfile -t COMPREPLY < <(compgen -d -- "$cur")
+      elif (( COMP_CWORD == 3 )) && [[ "$cur" != -* ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "10G 50G 100G 200G 500G 1T" -- "$cur")
+      else
+        mapfile -t COMPREPLY < <(compgen -W "--lv --loop --vg=" -- "$cur")
+      fi
+      ;;
+    setup)
+      if [[ "$cur" == -* ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "--auth=key --auth=password --auth=both" -- "$cur")
+      else
+        mapfile -t COMPREPLY < <(compgen -d -- "$cur")
+      fi
+      ;;
+    config)
+      (( COMP_CWORD == 2 )) && mapfile -t COMPREPLY < <(compgen -W "show init" -- "$cur")
+      ;;
+  esac
+}
+
+complete -F _sftpctl sftpctl

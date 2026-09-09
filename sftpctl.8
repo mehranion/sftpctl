@@ -1,0 +1,732 @@
+.TH SFTPCTL 8 "2026-09-08" "sftpctl 1.0" "System Administration Commands"
+.SH NAME
+sftpctl \- manage chrooted, shell-less SFTP/SCP accounts with disk quotas
+.
+.SH SYNOPSIS
+.B sftpctl
+.I command
+.RI [ arguments ]
+.RI [ options ]
+.
+.SH DESCRIPTION
+.B sftpctl
+creates and manages user accounts that can transfer files over
+.BR scp (1)
+or
+.BR sftp (1)
+and do nothing else: no shell, no port forwarding, and no visibility outside
+their own directory. Each account is confined by
+.B ChrootDirectory
+and capped by a per-user disk quota.
+.PP
+Accounts authenticate by password, public key, or both. The relevant
+.B sshd
+directives are written inside a
+.B "Match Group"
+block, so they apply only to these accounts and leave a hardened global
+configuration intact for ordinary logins.
+.
+.SH QUICK START
+Determine whether the account directory has its own filesystem. Quotas are a
+per-filesystem mechanism, so this decides everything that follows.
+.PP
+.RS 4
+.EX
+sudo findmnt \-no SOURCE,TARGET \-\-target /home
+.EE
+.RE
+.PP
+If
+.B TARGET
+is
+.BR /home ,
+enable quotas on it and proceed. If it is
+.BR / ,
+create a dedicated filesystem first with
+.BR "sftpctl provision" .
+See
+.B THE ROOT FILESYSTEM PROBLEM
+below.
+.PP
+.RS 4
+.EX
+sudo sftpctl provision /srv/sftp 10G
+sudo sftpctl setup /srv/sftp \-\-auth=both
+sudo sftpctl add alice 5 \-\-pass \-\-base=/srv/sftp
+.EE
+.RE
+.
+.SH COMMANDS
+.
+.SS volumes
+.B sftpctl volumes
+.PP
+Lists every volume group with size, free space, and logical-volume count, shows
+which one auto-selection would pick, and lists existing sftpctl volumes. On a
+server with several volume groups, run this before
+.BR provision .
+Aliased as
+.BR vgs .
+.
+.SS config
+.B sftpctl config
+.RB [ show | init ]
+.PP
+.B show
+(the default) prints every tunable with its effective value and where it came
+from.
+.B init
+writes a commented
+.I /etc/sftpctl.conf
+with the current values, pre-filling
+.B DEFAULT_VG
+with the volume group that has the most free space.
+.PP
+Precedence is environment, then config file, then built-in default. Note that
+.BR sudo (8)
+strips the environment by default, so an exported variable will not reach
+.B sftpctl
+unless you use
+.B sudo -E
+or set it inline.
+.
+.SS provision
+.B sftpctl provision
+.I mountpoint size
+.RB [ \-\-lv | \-\-loop | \-\-vg=\c
+.IR NAME ]
+.PP
+Creates a dedicated filesystem for SFTP accounts, formatted with the ext4 quota
+feature already enabled, adds an
+.BR fstab (5)
+entry after backing up the original, and mounts it.
+.TP
+.B \-\-lv
+New LVM logical volume from free volume-group space.
+.TP
+.BI \-\-vg= NAME
+Use a specific volume group. Implies
+.BR \-\-lv .
+.TP
+.B \-\-loop
+Sparse image file at
+.IR /var/lib/sftpctl/sftpdata.img .
+.PP
+With no mode given, an LV is created in the volume group with the most free
+space, falling back to a loop image if LVM is unavailable. A
+.B DEFAULT_VG
+in the config file overrides auto-selection;
+.B \-\-vg
+overrides both.
+.PP
+Free space is compared before
+.BR lvcreate (8)
+runs, so an oversized request aborts with the available groups listed rather
+than failing partway through.
+.PP
+Prefer
+.B \-\-lv
+when space allows: a real block device, no stacked filesystems, and growable
+later with
+.BR lvextend (8)
+and
+.BR resize2fs (8).
+The loop image is sparse, so the host filesystem can fill underneath it and
+accounts will hit
+.B ENOSPC
+while still under quota.
+.
+.SS setup
+.B sftpctl setup
+.RI [ mountpoint ]
+.RB [ \-\-auth=key | password | both ]
+.PP
+Run once per server. Verifies quota is active on the target filesystem, creates
+the
+.B sftpusers
+group, and writes
+.IR /etc/ssh/sshd_config.d/60-sftp-only.conf .
+.TP
+.B \-\-auth=key
+Public keys only.
+.TP
+.B \-\-auth=password
+Passwords only.
+.TP
+.B \-\-auth=both
+Either works. This is the default.
+.PP
+Re-running backs up the existing drop-in first. If
+.B "sshd -t"
+fails, the change is reverted and nothing is applied.
+.
+.SS add
+.B sftpctl add
+.I user
+.RI [ size ]
+.RI [ options ]
+.PP
+Creates an account, its chroot tree, and its quota.
+.TP
+.B \-\-pass
+Set a password, generated and printed once.
+.TP
+.B \-\-ask
+Prompt for the password, twice, without echoing.
+.TP
+.BI \-\-pass= SECRET
+Set a specific password. This lands in shell history and the process table;
+prefer
+.BR \-\-ask .
+.TP
+.BI \-\-key= STRING | FILE
+Authorize a public key at creation.
+.TP
+.BI \-\-base= DIR
+Parent directory. Defaults to
+.B DEFAULT_BASE
+.RI ( /home
+unless configured).
+.TP
+.BI \-\-expire= DAYS
+Set an account expiry date.
+.PP
+Sizes accept
+.BR 10 ,
+.BR 500M ,
+.BR 10G ,
+.BR 2T .
+A bare number means gigabytes.
+.PP
+Creating an account with neither
+.B \-\-pass
+nor
+.B \-\-key
+is permitted but warns: it has no way to log in until credentials are added.
+.
+.SS quota
+.B sftpctl quota
+.I user size
+.PP
+Changes a quota. Takes effect on the next write \(em no logout, no service
+reload, no account changes.
+.PP
+Shrinking below current usage is permitted and warns rather than blocking.
+Existing files remain; the user cannot write again until they delete something.
+.
+.SS passwd
+.B sftpctl passwd
+.I user
+.RB [ \-\-ask | \-\-stdin | \-\-gen | \-\-lock | \-\-unlock | \fIpassword\fR ]
+.PP
+With no argument or
+.BR \-\-gen ,
+generates and prints a new password.
+.B \-\-ask
+prompts twice without echoing.
+.B \-\-stdin
+reads one line from standard input, for scripted use.
+.B \-\-lock
+disables password authentication while leaving key authentication intact;
+.B \-\-unlock
+reverses it.
+.PP
+Password aging is disabled on every password this command sets. These accounts
+have no shell, so a user can never run
+.BR passwd (1);
+an expiring password would lock them out with no recovery path.
+.
+.SS addkey, delkey
+.B sftpctl addkey
+.I user
+.RB { \fIpubkey\fR | \fIfile\fR | \- }
+.br
+.B sftpctl delkey
+.I user
+.RI [ match ]
+.PP
+.B addkey
+accepts a key as a literal string, a file path, or
+.B \-
+for standard input. Duplicates are detected and skipped.
+.B delkey
+with no match presents a numbered picker; with a match it removes every key
+containing that string.
+.
+.SS list, show
+.B sftpctl list
+.br
+.B sftpctl show
+.I user
+.PP
+.B list
+tabulates usage, quota, percentage, and authentication method for every account,
+flagging any past 90 percent or lacking credentials.
+.B show
+gives the same detail for one account plus its home, shell, and expiry.
+.
+.SS disable, enable
+.B sftpctl disable
+.I user
+.br
+.B sftpctl enable
+.I user
+.PP
+.B disable
+locks the password and moves
+.I authorized_keys
+aside. Data and quota are untouched, so a disabled account still occupies disk.
+Use
+.B remove
+to reclaim space.
+.
+.SS remove
+.B sftpctl remove
+.I user
+.RB [ \-\-purge ]
+.PP
+Deletes the account. Without
+.BR \-\-purge ,
+the home directory and its contents are kept. Requires typing the username to
+confirm.
+.PP
+The quota is zeroed before
+.BR userdel (8).
+Otherwise the limit stays bound to the freed UID, and whichever account next
+reuses that UID silently inherits it.
+.
+.SS check
+.B sftpctl check
+.PP
+Audits sshd configuration, chroot ownership and permissions, shell assignment,
+credentials, and quota state across all accounts. Run after any manual change to
+.I /etc/ssh
+or the account directories.
+.
+.SH FILES
+.TP
+.I /etc/sftpctl.conf
+Configuration. Shell syntax, sourced at startup. Create with
+.BR "sftpctl config init" .
+.TP
+.I /etc/ssh/sshd_config.d/60-sftp-only.conf
+The
+.B "Match Group"
+block. Written by
+.BR setup ,
+backed up before any rewrite.
+.TP
+.I /var/lib/sftpctl/sftpdata.img
+Backing image when provisioned with
+.BR \-\-loop .
+.TP
+.I /etc/fstab
+Amended by
+.BR provision ,
+with a timestamped backup alongside.
+.
+.SH ENVIRONMENT
+All of these may also be set in
+.IR /etc/sftpctl.conf .
+The environment takes precedence.
+.TP
+.B DEFAULT_VG
+Volume group used by
+.BR provision .
+Unset means auto-select by free space.
+.TP
+.B DEFAULT_BASE
+Parent directory for new accounts. Default
+.IR /home .
+.TP
+.B DEFAULT_QUOTA_GB
+Quota when
+.B add
+is given no size. Default 10.
+.TP
+.B SFTP_GROUP
+Group the Match block targets. Default
+.BR sftpusers .
+Changing this after accounts exist orphans them.
+.TP
+.B UPLOAD_SUBDIR
+Writable directory inside each chroot. Default
+.BR upload .
+.TP
+.B SOFT_PCT
+Soft limit as a percentage of hard. Default 90.
+.TP
+.B INODES_PER_GB
+Inode cap scaling. Default 20000.
+.TP
+.B PASS_LENGTH
+Generated password length. Default 20.
+.TP
+.B SFTPCTL_CONFIG
+Alternate config file path.
+.
+.SH DIRECTORY LAYOUT
+.EX
+/srv/sftp/alice          root:root   755   chroot root, NOT user-writable
+|-- .ssh/
+|   \\-- authorized_keys  alice:alice 600   read by sshd as root, pre-chroot
+\\-- upload/              alice:alice 700   where files land
+.EE
+.PP
+.B ChrootDirectory
+requires the directory and every parent to be owned by root with no group or
+world write. The user therefore cannot write to their own home directory, which
+is why
+.I upload/
+exists inside it. Senders target
+.IR upload/ ,
+relative to the chroot; there is no absolute server path they can reach.
+.PP
+This is the most common misconfiguration, and sshd's response when it is wrong
+.RB ( "Connection closed" )
+identifies nothing.
+.B "sftpctl check"
+catches it.
+.
+.SH THE ROOT FILESYSTEM PROBLEM
+On a stock Ubuntu LVM install
+.I /home
+is a directory on
+.IR / ,
+not a mount point. Quotas cannot be used there, for two independent reasons.
+.PP
+First, enabling ext4 quotas means
+.BR "tune2fs -O quota" ,
+which requires the filesystem to be unmounted. A running root filesystem cannot
+be unmounted; the only offline path is rescue media. The deprecated alternative,
+external
+.I aquota.user
+and
+.I aquota.group
+files enabled by a
+.B usrquota
+mount option, is refused by current kernels with
+.BR "Device or resource busy" .
+.PP
+Second, and more fundamentally, a user quota on
+.I /
+limits that UID everywhere on
+.IR / ,
+including
+.I /tmp
+and
+.IR /var/tmp ,
+not merely the upload directory. Even if it could be enabled, it is the wrong
+mechanism.
+.PP
+.B "sftpctl provision"
+resolves both by giving the accounts their own filesystem, formatted with the
+quota feature from the outset.
+.
+.SH VERIFYING QUOTAS
+Use
+.BR repquota (8),
+not
+.BR quotaon (8):
+.PP
+.RS 4
+.EX
+sudo repquota \-u /srv/sftp
+.EE
+.RE
+.PP
+A table with grace times and a
+.B root
+row means quotas are working, even when otherwise empty. That is the
+authoritative test.
+.PP
+.B "quotaon -p"
+reports unreliably on a filesystem using the ext4 quota feature, because the
+kernel manages quotas through hidden inodes rather than the interface
+.B quotaon
+was built around. For the same reason
+.I /proc/mounts
+will not show a
+.B usrquota
+option; its absence is expected.
+.
+.SH EXAMPLES
+.SS Fresh server, /home on the root filesystem
+.EX
+sudo findmnt \-no SOURCE,TARGET \-\-target /home     # returns /
+sudo sftpctl volumes                              # inspect volume groups
+sudo sftpctl config init                          # pin DEFAULT_VG, DEFAULT_BASE
+sudo sftpctl provision /srv/sftp 100G
+sudo sftpctl setup /srv/sftp \-\-auth=both
+sudo sftpctl add alice 10 \-\-pass
+.EE
+.
+.SS Fresh server, /home already a separate filesystem
+.EX
+sudo systemctl stop sshd
+sudo umount /home
+sudo tune2fs \-O quota \-Q usrquota,grpquota /dev/mapper/vg\-home
+sudo mount /home
+sudo systemctl start sshd
+sudo sftpctl setup \-\-auth=both
+sudo sftpctl add alice 10 \-\-pass
+.EE
+.
+.SS Large server with several volume groups
+.EX
+sudo sftpctl volumes
+sudo sftpctl provision /srv/sftp 500G \-\-vg=data\-vg
+sudo sftpctl config init          # records DEFAULT_VG for later
+sudo sftpctl config show
+.EE
+.
+.SS Key-only vendor account, expiring after 90 days
+.EX
+sudo sftpctl setup /srv/sftp \-\-auth=key
+sudo sftpctl add vendor 50 \-\-key=/root/vendor.pub \-\-expire=90
+.EE
+.
+.SS Password account for a partner who cannot manage keys
+.EX
+sudo sftpctl setup /srv/sftp \-\-auth=both
+sudo sftpctl add partner 20 \-\-pass
+# password is printed once; record it before clearing the screen
+.EE
+.PP
+To choose the password yourself without it reaching shell history:
+.EX
+sudo sftpctl add partner 20 \-\-ask
+sudo sftpctl passwd partner \-\-ask
+.EE
+.PP
+From a script or secrets store:
+.EX
+pass\-cli show sftp/partner | sudo sftpctl passwd partner \-\-stdin
+.EE
+.
+.SS Adding a key to an existing password account
+.EX
+sudo sftpctl addkey partner /root/partner.pub
+sudo sftpctl passwd partner \-\-lock        # keys only from now on
+sudo sftpctl show partner
+.EE
+.
+.SS Rotating a forgotten password
+.EX
+sudo sftpctl passwd alice \-\-gen
+.EE
+.
+.SS "event not found" when typing a password
+An unquoted
+.B !
+triggers
+.BR bash (1)
+history expansion before
+.B sftpctl
+ever runs. Single-quote it, or avoid the command line entirely:
+.EX
+sudo sftpctl passwd alice 'Aa@!23456'
+sudo sftpctl passwd alice \-\-ask
+.EE
+.
+.SS Changing a quota
+.EX
+sudo sftpctl show alice                   # check usage before shrinking
+sudo sftpctl quota alice 500M
+sudo repquota \-u /srv/sftp                # verify independently
+.EE
+.
+.SS Finding who is filling the disk
+.EX
+sudo sftpctl list                         # accounts past 90% are flagged
+sudo du \-sh /srv/sftp/*/upload | sort \-h
+.EE
+.
+.SS Suspending and restoring an account
+.EX
+sudo sftpctl disable alice
+sudo sftpctl enable alice
+.EE
+.
+.SS Offboarding
+.EX
+sudo tar czf /backup/alice.tgz \-C /srv/sftp/alice upload
+sudo sftpctl remove alice \-\-purge
+.EE
+.
+.SS Growing the volume when it fills
+.EX
+sudo vgs                                  # confirm free extents
+sudo lvextend \-L +50G /dev/data\-vg/sftpdata
+sudo resize2fs /dev/data\-vg/sftpdata
+df \-h /srv/sftp
+.EE
+.
+.SS Auditing after a manual change
+.EX
+sudo sftpctl check
+.EE
+.
+.SH TROUBLESHOOTING
+.
+.SS Connection closes immediately after authentication
+The chroot directory is not owned by
+.B root:root
+or is group- or world-writable. This is by far the most common cause.
+.PP
+.RS 4
+.EX
+sudo sftpctl check
+sudo chown root:root /srv/sftp/alice && sudo chmod 755 /srv/sftp/alice
+.EE
+.RE
+.
+.SS Password is rejected but a key works
+Either a global
+.B "PasswordAuthentication no"
+is taking effect, or
+.B "UsePAM no"
+is blocking PAM-mediated password authentication.
+.PP
+.RS 4
+.EX
+sudo sftpctl setup /srv/sftp \-\-auth=both
+sudo sshd \-T | grep \-i \-e passwordauth \-e usepam
+.EE
+.RE
+.
+.SS scp fails but sftp works
+The client is forcing the legacy SCP protocol with
+.BR "scp -O" ,
+which requires a real shell. OpenSSH 9.0 and later use the SFTP protocol by
+default and work correctly. Remove the flag, or upgrade the client.
+.
+.SS "subsystem request failed"
+The
+.B Subsystem
+line is missing, or points at an external
+.B sftp-server
+binary that does not exist inside the chroot. Only
+.B internal-sftp
+works with
+.BR ChrootDirectory .
+.
+.SS Permission denied when writing
+The sender is targeting the chroot root instead of
+.IR upload/ .
+The chroot root is deliberately not writable.
+.PP
+.RS 4
+.EX
+scp file.tar alice@server:upload/          # correct
+scp file.tar alice@server:/               # fails
+.EE
+.RE
+.
+.SS Transfer stops partway with no clear error
+The quota was reached. SFTP reports this as a generic failure, and the partial
+file remains on disk still consuming quota.
+.PP
+.RS 4
+.EX
+sudo sftpctl show alice
+.EE
+.RE
+.
+.SS Account worked yesterday and fails today
+The password expired.
+.B sftpctl
+disables aging on passwords it sets, but a password set by another tool, or a
+.B PASS_MAX_DAYS
+policy applied afterwards, will expire. Since the account has no shell, the user
+cannot change it themselves.
+.PP
+.RS 4
+.EX
+sudo chage \-l alice
+sudo sftpctl passwd alice \-\-gen
+.EE
+.RE
+.
+.SS "quotaon: Device or resource busy"
+The kernel is refusing deprecated external
+.I aquota.*
+files. Clean up and use
+.B provision
+instead.
+.PP
+.RS 4
+.EX
+sudo quotaoff \-a 2>/dev/null; sudo rm \-f /aquota.user /aquota.group
+.EE
+.RE
+.
+.SS "tune2fs failed" during setup
+The target filesystem is mounted. The ext4 quota feature bit can only be set
+offline. See
+.BR "THE ROOT FILESYSTEM PROBLEM" .
+.
+.SS list shows 0K / 0K for every account
+A pre-1.0 version parsing
+.BR quota (1)
+rather than
+.BR repquota (8).
+.BR quota (1)
+prints the device in its first column, not the mount point, so the match
+silently failed and every figure read as zero. Upgrade.
+.
+.SS "insufficient free space" naming an unexpected volume group
+More than one volume group exists and auto-selection chose differently than you
+expected.
+.PP
+.RS 4
+.EX
+sudo sftpctl volumes
+sudo sftpctl provision /srv/sftp 100G \-\-vg=data\-vg
+.EE
+.RE
+.
+.SS Watching a live login attempt
+.EX
+sudo journalctl \-u sshd \-f
+sudo /usr/sbin/sshd \-d \-p 2222        # debug mode, alternate port
+.EE
+.
+.SH SECURITY NOTES
+Quotas cap consumption; they do not reserve it. A 10 GB quota on a 10 GB volume
+lets a single account fill the entire filesystem. With several accounts, size
+each at a fraction of the volume so one sender cannot starve the others.
+.PP
+Each account receives an inode cap alongside its space cap, 20000 per gigabyte
+by default. Without one, an account can exhaust the filesystem's inodes with
+millions of empty files while remaining well under its space quota.
+.PP
+Generated passwords are shown once and stored only as a hash. They cannot be
+recovered, only replaced.
+.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Error. The condition is described on standard error; where a failure occurs
+partway, the command reports what was and was not applied.
+.
+.SH LICENSE
+MIT. See the
+.I LICENSE
+file distributed with this software.
+.
+.SH SEE ALSO
+.BR sshd_config (5),
+.BR sftp (1),
+.BR scp (1),
+.BR setquota (8),
+.BR repquota (8),
+.BR quotaon (8),
+.BR tune2fs (8),
+.BR lvcreate (8),
+.BR lvextend (8),
+.BR chage (1),
+.BR fstab (5)
